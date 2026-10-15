@@ -235,131 +235,180 @@ let interp (m:mach) (x:operand) : int64 =
 let step (m:mach) : unit =
   (* 1. FETCH: Get current instruction pointer value *)
   let rip_val = m.regs.(rind Rip) in
-  
-  (* Look up the instruction in memory *)
-  let (opcode, args) = 
-    match map_addr rip_val with
-    | Some i -> 
-        (match m.mem.(i) with
-         | InsB0 (op, a) -> (op, a)
-         | _ -> failwith "Execution error: %rip does not point to a valid InsB0")
-    | None -> 
-        raise X86lite_segfault 
-  in
 
-  (* 2. ADVANCE: Increment %rip by 8 (the instruction size) BEFORE executing *)
+  let (opcode, args) =
+    match map_addr rip_val with
+      | Some i ->
+        (match m.mem.(i) with
+          | InsB0(opcode, args) -> (opcode, args)
+          | _ -> failwith "invalid instruction at %rip")
+      | None -> raise X86lite_segfault
+      in
+    
+
   m.regs.(rind Rip) <- Int64.add rip_val 8L;
 
-  (* 3. DECODE & EXECUTE: Match on the opcode and its operands *)
-  match opcode, args with
+  let set_flags {Int64_overflow.value; overflow} =
+    m.flags.fo <- overflow;
+    m.flags.fs <- (value < 0L);
+    m.flags.fz <- (value = 0L)
+  in
+
   
-  (* Example 1: Data Movement *)
-  | Movq, [src; dest] ->
+  match (opcode, args) with
+   | Movq, [src; dst] -> write_op m dst (interp m src)
+   | Leaq, [ind; dst] -> 
+      let addr = 
+        match ind with
+          | Ind1 (Lit i) -> i
+          | Ind2 r -> m.regs.(rind r)
+          | Ind3 (Lit offset, r) -> Int64.add offset m.regs.(rind r)
+          | _ -> failwith "invalid leaq source (must be Ind)"
+      in
+      write_op m dst addr
+  (*Arithmetic*)
+   | Addq, [src; dst] ->
       let src_val = interp m src in
-      write_op m dest src_val
+      let dst_val = interp m dst in
+      let res = Int64_overflow.add src_val dst_val in
+      set_flags res;
+      write_op m dst res.value
 
-  (* Example 2: Arithmetic (requires reading dest, calculating, writing back) *)
-  | Addq, [src; dest] ->
+   | Subq, [src; dst] ->
       let src_val = interp m src in
-      let dest_val = interp m dest in
-      let result = Int64.add dest_val src_val in
-      
-      (* Write the result back to the destination *)
-      write_op m dest result;
-      
-      (* 4. UPDATE FLAGS: Addq modifies condition codes *)
-      (* You will need to write flag-setting logic based on x86lite semantics *)
-      if result = 0L then m.flags.fz <- true else m.flags.fz <- false;
-      (* ... set fs (sign) and fo (overflow) appropriately ... *)
-
-  (* Example 3: Control Flow (manipulates %rip directly) *)
-  | Subq, [src; dest] ->
+      let dst_val = interp m dst in
+      let res = Int64_overflow.sub dst_val src_val in
+      set_flags res;
+      write_op m dst res.value
+   | Imulq, [src; dst] ->
       let src_val = interp m src in
-      let dest_val = interp m dest in
-      let result = Int64.sub dest_val src_val in
-      write_op m dest result;
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L)
-      (* Note: Overflow (fo) for subtraction happens when the signs of 
-         the operands differ and the result sign matches the source sign *)
+      let dst_val = interp m dst in
+      let res = Int64_overflow.mul src_val dst_val in
+      set_flags res;
+      write_op m dst res.value
 
-  | Andq, [src; dest] ->
+   | Andq, [src; dst] ->
       let src_val = interp m src in
-      let dest_val = interp m dest in
-      let result = Int64.logand dest_val src_val in
-      write_op m dest result;
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L);
-      m.flags.fo <- false (* AND always clears the overflow flag in x86 *)
+      let dst_val = interp m dst in
+      let res = Int64.logand src_val dst_val in
+      m.flags.fo <- false;
+      m.flags.fs <- (res < 0L);
+      m.flags.fz <- (res = 0L); 
+      write_op m dst res
 
-  | Negq, [dest] ->
-      let dest_val = interp m dest in
-      let result = Int64.neg dest_val in
-      write_op m dest result;
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L)
-
-  | Shlq, [amt; dest] ->
-      (* Shift amount must be cast to a standard int for OCaml's shift function *)
-      let amt_val = Int64.to_int (interp m amt) in
-      let dest_val = interp m dest in
-      let result = Int64.shift_left dest_val amt_val in
-      write_op m dest result;
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L)
-
-  | Imulq, [src; dest] ->
+   | Orq, [src; dst] ->
       let src_val = interp m src in
-      let dest_val = interp m dest in
-      let result = Int64.mul dest_val src_val in
-      write_op m dest result;
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L)
+      let dst_val = interp m dst in
+      let res = Int64.logor src_val dst_val in
+      m.flags.fo <- false;
+      m.flags.fs <- (res < 0L);
+      m.flags.fz <- (res = 0L); 
+      write_op m dst res
 
-  (* --------------------------------------------------------- *)
-  (* 2. STACK OPERATIONS                                       *)
-  (* --------------------------------------------------------- *)
-
-  | Pushq, [src] ->
+   | Xorq, [src; dst] ->
       let src_val = interp m src in
-      (* 1. Subtract 8 from the stack pointer *)
+      let dst_val = interp m dst in
+      let res = Int64.logxor src_val dst_val in
+      m.flags.fo <- false;
+      m.flags.fs <- (res < 0L);
+      m.flags.fz <- (res = 0L); 
+      write_op m dst res
+
+  (*Unary Operations*)
+   | Incq, [src] ->
+      let src_val = interp m src in
+      let res = Int64_overflow.succ src_val in
+      set_flags res;
+      write_op m src res.value
+
+   | Decq, [src] ->
+      let src_val = interp m src in
+      let res = Int64_overflow.pred src_val in
+      set_flags res;
+      write_op m src res.value
+
+   | Negq, [src] ->
+      let src_val = interp m src in
+      let res = Int64_overflow.neg src_val in
+      set_flags res;
+      write_op m src res.value
+   | Notq, [src] ->
+      let src_val = interp m src in
+      let res = Int64.lognot src_val in
+      write_op m src res
+  
+    (*shifts*)
+   | Shlq, [amt; dst] ->
+      let n = Int64.to_int (interp m amt) in
+      let dst_val = interp m dst in
+      let res = Int64.shift_left dst_val n in
+      if (n > 0) then(
+        m.flags.fz <- (res = 0L);
+        m.flags.fs <- (res < 0L)
+        );
+      write_op m dst res
+   | Sarq, [amt; dst] ->
+      let n = Int64.to_int (interp m amt) in
+      let dst_val = interp m dst in
+      let res = Int64.shift_right dst_val n in
+      if (n > 0) then(
+        m.flags.fz <- (res = 0L);
+        m.flags.fs <- (res < 0L)
+        );
+      write_op m dst res
+   | Shrq, [amt; dst] ->
+      let n = Int64.to_int (interp m amt) in
+      let dst_val = interp m dst in
+      let res = Int64.shift_right_logical dst_val n in
+      if (n > 0) then(
+        m.flags.fz <- (res = 0L);
+        m.flags.fs <- (res < 0L)
+        );
+      write_op m dst res
+(*Stack Operations*)
+   | Pushq, [src] ->
       let current_rsp = m.regs.(rind Rsp) in
-      let new_rsp = Int64.sub current_rsp 8L in
+      m.regs.(rind Rsp) <- Int64.sub current_rsp 8L;
+      write_mem m (m.regs.(rind Rsp)) (interp m src)
+
+   | Popq, [dest] ->
+      let v = read_mem m m.regs.(rind Rsp) in
+      m.regs.(rind Rsp) <- Int64.add m.regs.(rind Rsp) 8L;
+      write_op m dest v
+
+(*Comparisons and Conditions*)
+   | Cmpq, [src; dst] ->
+      let src_val = interp m src in
+      let dst_val = interp m dst in
+      let res = Int64_overflow.sub dst_val src_val in
+      set_flags res
+
+   | Set cnd, [dst] ->
+      let old_val = interp m dst in
+      let cleared = Int64.logand old_val (Int64.lognot 0xFFL) in
+      let byte_val = if interp_cnd m.flags cnd then 1L else 0L in
+      let new_val = Int64.logor cleared byte_val in
+      write_op m dst new_val
+(*Control Flow*)
+   
+   | Jmp, [target] ->
+      m.regs.(rind Rip) <- interp m target
+   | J cnd, [target] ->
+      if interp_cnd m.flags cnd then m.regs.(rind Rip) <- interp m target
+   | Callq, [target] ->
+      let new_rsp = Int64.sub m.regs.(rind Rsp) 8L in
       m.regs.(rind Rsp) <- new_rsp;
-      (* 2. Write the value to the new memory address *)
-      write_mem m new_rsp src_val
+      write_mem m new_rsp m.regs.(rind Rip);
+      m.regs.(rind Rip) <- interp m target
 
-  | Popq, [dest] ->
-      (* 1. Read the value from the current stack pointer address *)
-      let current_rsp = m.regs.(rind Rsp) in
-      let val_from_stack = read_mem m current_rsp in
-      (* 2. Write that value into the destination operand *)
-      write_op m dest val_from_stack;
-      (* 3. Add 8 to the stack pointer *)
-      m.regs.(rind Rsp) <- Int64.add current_rsp 8L
+   | Retq, [] ->
+      let return_addr = read_mem m m.regs.(rind Rsp) in
+      m.regs.(rind Rsp) <- Int64.add m.regs.(rind Rsp) 8L;
+      m.regs.(rind Rip) <- return_addr
 
-  (* --------------------------------------------------------- *)
-  (* 3. COMPARISONS                                            *)
-  (* --------------------------------------------------------- *)
+    | _ -> failwith "unknown or invalid instruction"
 
-  | Cmpq, [src; dest] ->
-      let src_val = interp m src in
-      let dest_val = interp m dest in
-      let result = Int64.sub dest_val src_val in
-      (* CRITICAL: Do NOT write_op the result back for Cmpq! *)
-      
-      (* Just set the flags so subsequent jumps know what to do *)
-      m.flags.fz <- (result = 0L);
-      m.flags.fs <- (result < 0L)
-      
-  | Jmp, [src] ->
-      let target_addr = interp m src in
-      m.regs.(rind Rip) <- target_addr
-
-  (* Catch-all for unimplemented instructions *)
-  | _ -> 
-      failwith "Instruction semantics not yet implemented"
-
+  
 (* Runs the machine until the rip register reaches a designated
    memory address. Returns the contents of %rax when the 
    machine halts. *)
@@ -398,7 +447,86 @@ exception Redefined_sym of lbl
   HINT: List.fold_left and List.fold_right are your friends.
  *)
 let assemble (p:prog) : exec =
-failwith "assemble unimplemented"
+  let text_pos = 0x400000L in
+  let is_text e = match e.asm with Text _ -> true | Data _ -> false in
+  let text_elems = List.filter is_text p in
+  let data_elems = List.filter (fun e -> not (is_text e)) p in  
+
+   let (data_pos, sym_tab_after_text) =
+    let process_text (addr, sym_tab) e =
+      if List.mem_assoc e.lbl sym_tab then
+        raise (Redefined_sym e.lbl);
+      let ins_list = match e.asm with Text is -> is | _ -> [] in
+      let size = Int64.of_int (List.length ins_list * 8) in
+      let new_addr = Int64.add addr size in
+      let new_sym_tab = (e.lbl, addr) :: sym_tab in
+      (new_addr, new_sym_tab)
+    in
+    List.fold_left process_text (text_pos, []) text_elems
+  in
+
+  let size_of_data = function
+    | Quad _  -> 8L
+    | Asciz s -> Int64.of_int (String.length s + 1)
+  in
+  
+  let (_, full_sym_tab) =
+    let process_data (addr, sym_tab) e =
+      if List.mem_assoc e.lbl sym_tab then
+        raise (Redefined_sym e.lbl);
+      let data_list = match e.asm with Data ds -> ds | _ -> [] in
+      let block_size = List.fold_left (fun acc d -> Int64.add acc (size_of_data d)) 0L data_list in
+      let new_addr = Int64.add addr block_size in
+      let new_sym_tab = (e.lbl, addr) :: sym_tab in
+      (new_addr, new_sym_tab)
+    in
+    List.fold_left process_data (data_pos, sym_tab_after_text) data_elems
+  in
+
+  let entry = 
+    match List.assoc_opt "main" full_sym_tab with
+    | Some addr -> addr
+    | None      -> raise (Undefined_sym "main")
+  in
+
+  let resolve_lbl l =
+    match List.assoc_opt l full_sym_tab with
+    | Some addr -> addr
+    | None      -> raise (Undefined_sym l)
+  in
+
+  let resolve_op = function
+    | Imm (Lbl l)     -> Imm (Lit (resolve_lbl l))
+    | Ind1 (Lbl l)    -> Ind1 (Lit (resolve_lbl l))
+    | Ind3 (Lbl l, r) -> Ind3 (Lit (resolve_lbl l), r)
+    | other_op        -> other_op
+  in
+
+
+  let serialize_ins (op, args) =
+    sbytes_of_ins (op, List.map resolve_op args)
+  in
+  let text_seg =
+    List.concat_map (fun e ->
+      match e.asm with
+      | Text is -> List.concat_map serialize_ins is
+      | _ -> []
+    ) text_elems
+  in
+
+  let serialize_data = function
+    | Quad (Lbl l) -> sbytes_of_data (Quad (Lit (resolve_lbl l)))
+    | d            -> sbytes_of_data d
+  in
+  let data_seg =
+    List.concat_map (fun e ->
+      match e.asm with
+      | Data ds -> List.concat_map serialize_data ds
+      | _ -> []
+    ) data_elems
+  in
+
+  { entry; text_pos; data_pos; text_seg; data_seg }
 
 (* Convert an object file into an executable machine state. 
     - allocate the mem array
@@ -414,4 +542,25 @@ failwith "assemble unimplemented"
   may be of use.
 *)
 let load {entry; text_pos; data_pos; text_seg; data_seg} : mach = 
-failwith "load unimplemented"
+  let mem = Array.make mem_size (Byte '\x00') in
+  let text_posInd = 
+    match map_addr text_pos with Some i -> i | None -> raise X86lite_segfault in
+  List.iteri (fun offset txt -> mem.(text_posInd + offset) <- txt) text_seg;
+  let data_posInd = 
+    match map_addr data_pos with Some i -> i | None -> raise X86lite_segfault in
+  List.iteri (fun offset dta -> mem.(data_posInd + offset) <- dta) data_seg;
+
+  let regs = Array.make nregs 0L in
+  regs.(rind Rip) <- entry;
+
+  let stack_top = Int64.sub mem_top 8L in
+  
+  regs.(rind Rsp) <- stack_top;
+  
+  let stack_idx = match map_addr stack_top with Some i -> i | None -> raise X86lite_segfault in
+  List.iteri (fun offset adr -> mem.(stack_idx + offset) <- adr) (sbytes_of_int64 exit_addr);
+
+  let flags = { fo = false; fs = false; fz = false } in
+  { flags; regs; mem }
+
+
