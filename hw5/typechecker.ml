@@ -270,7 +270,7 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
         else 
           type_error e "expr args not subtype of call args"
       | _ -> type_error e "expr does not match func type")
-    | _ -> type_error e "exp is not yet implemented" 
+    
 
 
 
@@ -334,8 +334,18 @@ let typecheck_tdecl (tc : Tctxt.t) id fs  (l : 'a Ast.node) : unit =
     - typechecks the body of the function (passing in the expected return type
     - checks that the function actually returns
 *)
+let rec check_dups_f args =
+  match args with
+  | [] -> false
+  | h :: t -> 
+    let (ty, id) = h in
+    (List.exists (fun x -> 
+      let (ty1, id1) = x in
+      id1 = id) t) || check_dups_f t
+
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
-  failwith "todo: typecheck_fdecl"
+  failwith "todo"
+
 
 (* creating the typchecking context ----------------------------------------- *)
 
@@ -369,17 +379,51 @@ let create_struct_ctxt (p:Ast.prog) : Tctxt.t =
   List.fold_left (fun acc_c decl ->
     match decl with 
     | Gtdecl td ->
-      if 
-      match td.elt with
-      | (id, fields) ->
-        add_struct c id fields
+      let (id, fields) = td.elt in
+      (match lookup_struct_option id acc_c with
+       | Some _ -> type_error td "struct already in context"
+       | None -> 
+        if (check_dups fields) then
+          type_error td "struct contains duplicate fields"
+        else
+          add_struct acc_c id fields)
+    | _ -> acc_c
     ) c p
 
 let create_function_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
+  let c_builtin = List.fold_left (fun acc_c (fname, (args, ret)) ->
+    add_global acc_c fname (TRef(RFun(args, ret)))
+    ) tc builtins
+  in
+  List.fold_left (fun acc_c decl ->
+    match decl with 
+    | Gfdecl fd ->
+      let fname = fd.elt.fname in
+      let args = fd.elt.args in
+      let frtyp = fd.elt.frtyp in
+      (match lookup_global_option fname acc_c with
+      | Some _ -> type_error fd "func already in context"
+      | None -> 
+        if (check_dups_f args) then
+          type_error fd "func contains duplicate args"
+        else
+          let f_ty = TRef (RFun (List.map fst args, frtyp)) in
+          add_global acc_c fname f_ty)
+    | _ -> acc_c
+    ) c_builtin p
 
 let create_global_ctxt (tc:Tctxt.t) (p:Ast.prog) : Tctxt.t =
-  failwith "todo: create_function_ctxt"
+ List.fold_left (fun acc_c decl ->
+    match decl with 
+    | Gvdecl gd ->
+      let x = gd.elt.name in
+      let gexp = gd.elt.init in
+      let t = typecheck_exp tc gexp in
+      (match lookup_global_option x acc_c with
+      | Some _ -> type_error gd "var already in context"
+      | None -> add_global acc_c x t)
+    | _ -> acc_c 
+  ) tc p 
 
 
 (* This function implements the |- prog and the H ; G |- prog 
