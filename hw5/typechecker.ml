@@ -308,8 +308,119 @@ let rec typecheck_exp (c : Tctxt.t) (e : Ast.exp node) : Ast.ty =
      block typecheck rules.
 *)
 let rec typecheck_stmt (tc : Tctxt.t) (s:Ast.stmt node) (to_ret:ret_ty) : Tctxt.t * bool =
-  failwith "todo: implement typecheck_stmt"
+  match s.elt with
+  | Assn (lhs, exp) ->
+    (match lhs.elt with
+    | Id id -> 
+      (match lookup_local_option id tc with
+      | Some _ -> ()
+      | None -> 
+        (match lookup_global_option id tc with
+        | Some (TRef(RFun _)) -> 
+          type_error s "cannot reassign global function"
+        | _ -> ()))
+    | Index _ | Proj _ -> ()
+    | _ -> type_error s "invalid lhs of assignent" );
+    let tl = typecheck_exp tc lhs in
+    let te = typecheck_exp tc exp in
+    if (subtype tc te tl) then
+      (tc, false)
+    else
+      type_error s "expr is not a subtype of lhs"
+  | Decl (id, exp) ->
+    (match lookup_local_option id tc with
+    | Some _ -> type_error s "var id already defined in local context"
+    | None -> 
+      let t = typecheck_exp tc exp in
+      let tnew = add_local tc id t in
+      (tnew, false)
+    )
+  | SCall (f, args) ->
+    (match typecheck_exp tc f with
+    | TRef(RFun (fargs, RetVoid)) ->
+      let types = List.map (fun arg -> typecheck_exp tc arg) args in
+      let rec subcheck ty1 ty2 = 
+        (match ty1, ty2 with
+        | [], [] -> true
+        | x::xs, y::ys -> subtype tc x y && subcheck xs ys
+        | _ -> false)
+      in
+      if (subcheck types fargs) then
+        (tc, false)
+      else
+        type_error s "args are not subtype of function def args"
+    | _ ->type_error s "not of type func"
+    )
+  | If (e, b1, b2) ->
+    (match typecheck_exp tc e with
+    | TBool -> 
+      let r1 = typecheck_block tc b1 to_ret in
+      let r2 = typecheck_block tc b2 to_ret in
+      (tc, r1 && r2)
+    | _ -> type_error s "if condition must be a bool")
+  | Cast (rty, id, exp, b1, b2) ->
+    (match typecheck_exp tc exp with
+    | TNullRef ref -> 
+      (match subtype_ref tc ref rty with
+      | true ->
+        let tc_b1 = add_local tc id (TRef rty) in
+        let r1 = typecheck_block tc_b1 b1 to_ret in
+        let r2 = typecheck_block tc b2 to_ret in
+        (tc, r1 && r2)
+      | _ -> type_error s "cannot cast expression to target reference type")
+    | _ -> type_error s "if? expression must be a nullable reference")
+  | While (e, bl) ->
+    (match typecheck_exp tc e with
+    | TBool -> 
+      let r = typecheck_block tc bl to_ret in
+      (tc, false)
+    | _ ->  type_error e "conditional expr is not a bool"
+    )
+  | For (vars, e_opt, stmt_opt, bl) ->
 
+    let cnew = List.fold_left (fun acc_c (id,exp) ->
+      (match lookup_local_option id acc_c with
+      | Some _ -> type_error s "var id already defined in local context"
+      | None -> 
+        let t = typecheck_exp acc_c exp in
+        add_local acc_c id t
+    )) tc vars 
+    in
+
+    (match e_opt with
+    | Some e ->
+      (match typecheck_exp cnew e with
+      | TBool -> ()
+      | _ -> type_error s "for loop guard must be a bool")
+    | None -> ());
+
+    (match stmt_opt with
+    | Some stmt -> 
+      let (_, r1) = typecheck_stmt cnew stmt to_ret in
+      if r1 then type_error s "for loop update statement cannot return"
+    | None -> ());
+
+    let _ = typecheck_block cnew bl to_ret in
+    (tc, false)
+  | Ret e_opt ->
+    (match e_opt, to_ret with
+    | Some exp, RetVal expected_ty  ->
+      let t = typecheck_exp tc exp in
+      if (subtype tc t expected_ty) then
+        (tc, true)
+      else
+        type_error s "return type does not match expected type"
+    | None, RetVoid -> (tc, true)
+    | Some _, RetVoid -> type_error s "cannot return a value from a void function"
+    | None, RetVal _ -> type_error s "missing return value in non-void function")
+
+
+and typecheck_block (tc : Tctxt.t) (body : Ast.block) (frtyp : Ast.ret_ty) : bool =
+  let tc, res = List.fold_left (fun (c, ret) stmt ->
+    if ret then type_error stmt "unreachable code after return"
+    else typecheck_stmt c stmt frtyp 
+  ) (tc, false) body in
+  res
 
 (* struct type declarations ------------------------------------------------- *)
 (* Here is an example of how to implement the TYP_TDECLOK rule, which is 
@@ -344,7 +455,22 @@ let rec check_dups_f args =
       id1 = id) t) || check_dups_f t
 
 let typecheck_fdecl (tc : Tctxt.t) (f : Ast.fdecl) (l : 'a Ast.node) : unit =
-  failwith "todo"
+  let frtyp = f.frtyp in
+  let fname = f.fname in
+  let args = f.args in
+  let body = f.body in
+  if (check_dups_f args) then
+    type_error l "func contains duplicate args"
+  else
+    let c = List.fold_left (fun acc_c (ty, id) ->
+      add_local acc_c id ty
+    ) tc args 
+    in
+    if (typecheck_block c body frtyp) then
+      ()
+    else 
+      type_error l "func does not return"
+
 
 
 (* creating the typchecking context ----------------------------------------- *)
