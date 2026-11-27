@@ -405,7 +405,10 @@ and cmp_exp_lhs (tc : TypeCtxt.t) (c:Ctxt.t) (e:exp node) : Ll.ty * Ll.operand *
     let ptr_id, tmp_id = gensym "index_ptr", gensym "tmp" in
     ans_ty, (Id ptr_id),
     arr_code >@ ind_code >@ lift
-      [ptr_id, Gep(arr_ty, arr_op, [i64_op_of_int 0; i64_op_of_int 1; ind_op]) ]
+      [ tmp_id, Bitcast (arr_ty, arr_op, Ptr I64)
+      ; "",     Call (Void, Gid "oat_assert_array_length", [(Ptr I64, Id tmp_id); (I64, ind_op)])
+      ; ptr_id, Gep (arr_ty, arr_op, [i64_op_of_int 0; i64_op_of_int 1; ind_op]) ]
+
 
    
 
@@ -478,8 +481,24 @@ and cmp_stmt (tc : TypeCtxt.t) (c:Ctxt.t) (rt:Ll.ty) (stmt:Ast.stmt node) : Ctxt
          merge label after either block
   *)
   | Ast.Cast (typ, id, exp, notnull, null) ->
-    failwith "todo: implement Ast.Cast case"
-
+    let ll_ty = cmp_ty tc (TRef typ) in
+    let op, exp_code = cmp_exp_as tc c exp ll_ty in
+    let is_null = gensym "is_null" in
+    let slot = gensym id in
+    let c' = Ctxt.add c id (Ptr ll_ty, Id slot) in
+    let notnull_code = cmp_block tc c' rt notnull in
+    let null_code = cmp_block tc c rt null in
+    let lnotnull, lnull, lmerge = gensym "notnull", gensym "null", gensym "merge" in
+    c, exp_code
+       >:: I (is_null, Icmp (Ll.Eq, ll_ty, op, Null))
+       >:: T (Cbr (Id is_null, lnull, lnotnull))
+       >:: L lnotnull
+       >:: E (slot, Alloca ll_ty)
+       >:: I ("", Store (ll_ty, op, Id slot))
+       >@ notnull_code >:: T (Br lmerge)
+       >:: L lnull >@ null_code >:: T (Br lmerge)
+       >:: L lmerge
+       
   | Ast.While (guard, body) ->
      let guard_ty, guard_op, guard_code = cmp_exp tc c guard in
      let lcond, lbody, lpost = gensym "cond", gensym "body", gensym "post" in
